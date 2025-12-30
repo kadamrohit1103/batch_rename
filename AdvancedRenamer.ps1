@@ -10,10 +10,12 @@
 
 .PARAMETER inputfile
     Path to the .csv file containing the mapping.
-    Expected columns: "Old Name", "New Name" (or specified via -map).
+    Expected columns: "Folder Path", "Old Name", "New Name"
+    OR Legacy columns: "Old Name", "New Name" (uses -targetdir)
 
 .PARAMETER targetdir
-    The directory containing the files to be renamed. Default is current directory.
+    The directory containing the files to be renamed. 
+    Only used if CSV doesn't have a "Folder Path" column.
 
 .PARAMETER map
     Column indices (0-based) for OldName,NewName. Default "0,1".
@@ -65,31 +67,80 @@ function Get-UniqueFilename ($dir, $filename, $occupiedPaths) {
         $newVal = "${name}_${count}${ext}"
         $count++
     }
+
+function Process-FileRename {
+    param($file, $newName, $conflict, [ref]$OccupiedPaths, $dryrun, [ref]$ops)
+    
+    $dir = $file.DirectoryName
+    $destPath = Join-Path $dir $newName
+    
+    # Check Conflict
+    if ((Test-Path $destPath) -or ($OccupiedPaths.Value -contains $destPath)) {
+        if ($conflict -eq "skip") {
+            Write-Warn "Target '$newName' exists. Skipping."
+            return
+        } elseif ($conflict -eq "autonumber") {
+            $newName = Get-UniqueFilename -dir $dir -filename $newName -occupiedPaths $OccupiedPaths.Value
+            $destPath = Join-Path $dir $newName
+            Write-Info "Conflict resolved: Renaming to '$newName'"
+        } elseif ($conflict -eq "overwrite") {
+            Write-Warn "Overwriting '$newName'"
+            if (-not $dryrun) { Remove-Item $destPath -Force }
+        }
+    }
+    
+    $OccupiedPaths.Value += $destPath
+    
+    if ($dryrun) {
+        Write-Host "[PREVIEW] '$($file.Name)' -> '$newName'" -ForegroundColor Cyan
+    } else {
+        try {
+            Rename-Item -LiteralPath $file.FullName -NewName $newName
+            Write-Success "'$($file.Name)' -> '$newName'"
+            $ops.Value += @{ source = $file.FullName; dest = $destPath }
+        } catch {
+            Write-ErrorMsg "Failed to rename '$($file.Name)': $($_.Exception.Message)"
+        }
+    }
+}
     return $newVal
 }
 
 function Read-CsvData {
-    param($Path, $OldIdx, $NewIdx)
+    param($Path)
     try {
-        # Import CSV without headers to treat by index
-        $raw = Import-Csv $Path -Header "C0","C1","C2","C3","C4","C5" # Dummy headers for up to 6 cols
-        # Skip user header if needed? Usually Import-Csv handles headers nicely if we know names.
-        # But we are using indices.
-        
-        # Better approach: Read raw content? No, Import-Csv is best.
-        # Let's assume standard headers "Old Name" and "New Name" OR use indices logic manually.
-        # For simplicity in this hybrid tool, let's treat it by index manually.
-        
         $lines = Get-Content $Path
         $data = @()
-        # Skip header row 1
-        for ($i = 1; $i -lt $lines.Count; $i++) {
-            $cols = $lines[$i] -split ","
-            if ($cols.Count -gt $NewIdx) {
-                $o = $cols[$OldIdx].Trim('"').Trim()
-                $n = $cols[$NewIdx].Trim('"').Trim()
-                if ($o -and $n) {
-                    $data += [PSCustomObject]@{ OldName = $o; NewName = $n }
+        
+        # Detect mode based on column count of first data row
+        if ($lines.Count -gt 1) {
+            $cols = $lines[1] -split ","
+            if ($cols.Count -ge 3) {
+                # 3-Column Mode: Folder, Old, New
+                Write-Info "Detected 3-column CSV (Folder, Old, New)"
+                for ($i = 1; $i -lt $lines.Count; $i++) {
+                    $cols = $lines[$i] -split ","
+                    if ($cols.Count -ge 3) {
+                        $p = $cols[0].Trim('"').Trim()
+                        $o = $cols[1].Trim('"').Trim()
+                        $n = $cols[2].Trim('"').Trim()
+                        if ($o -and $n) {
+                            $data += [PSCustomObject]@{ Path=$p; OldName=$o; NewName=$n; Mode="Direct" }
+                        }
+                    }
+                }
+            } else {
+                # 2-Column Mode: Old, New
+                Write-Info "Detected 2-column CSV (Old, New) - Using TargetDir"
+                for ($i = 1; $i -lt $lines.Count; $i++) {
+                    $cols = $lines[$i] -split ","
+                    if ($cols.Count -ge 2) {
+                        $o = $cols[0].Trim('"').Trim()
+                        $n = $cols[1].Trim('"').Trim()
+                        if ($o -and $n) {
+                            $data += [PSCustomObject]@{ Path=$null; OldName=$o; NewName=$n; Mode="Scan" }
+                        }
+                    }
                 }
             }
         }
@@ -178,7 +229,7 @@ $nidx = [int]$indices[1]
 Write-Info "Reading mapping..."
 $Mapping = @()
 if ($inputfile -match "\.csv$") {
-    $Mapping = Read-CsvData -Path $FullPathInput -OldIdx $oidx -NewIdx $nidx
+    $Mapping = Read-CsvData -Path $FullPathInput
 } else {
     Write-ErrorMsg "Unsupported file type. Please use .csv"
     exit 1
@@ -189,57 +240,64 @@ if ($Mapping.Count -eq 0) { Write-Info "No renaming rules found."; exit }
 # Get Files
 $ResolvedTarget = Resolve-Path $targetdir
 Write-Info "Target Directory: $ResolvedTarget"
-$files = Get-ChildItem -Path $ResolvedTarget -File -Recurse:$subfolders
+# Only scan if we have rules that need scanning (Mode=Scan)
+$hasScanRules = $Mapping | Where-Object { $_.Mode -eq "Scan" }
+$files = @()
+if ($hasScanRules) {
+    Write-Info "Scanning for files (Legacy Mode)..."
+    $files = Get-ChildItem -Path $ResolvedTarget -File -Recurse:$subfolders
+}
+
 
 Write-Info "Found $($files.Count) files. Processing $($Mapping.Count) rules..."
 
 $ops = @()
 $OccupiedPaths = @() # Track paths we reserve in this run
 
-foreach ($rule in $Mapping) {
-    # Find the file in our list (Case insensitive matches roughly in Windows)
-    # Simple search: Match by Name property
-    $matches = $files | Where-Object { $_.Name -eq $rule.OldName }
+# --- Processing Logic ---
+
+# 1. Handle Direct Mode (Grouped by Folder for Speed)
+$DirectRules = $Mapping | Where-Object { $_.Mode -eq "Direct" }
+if ($DirectRules) {
+    Write-Info "Processing rules (Grouped by Directory)..."
+    $Groups = $DirectRules | Group-Object Path
     
-    if (-not $matches) {
-        Write-Warn "File not found: '$($rule.OldName)'"
-        continue
-    }
-    
-    foreach ($file in $matches) {
-        $dir = $file.DirectoryName
-        $newName = $rule.NewName
-        $destPath = Join-Path $dir $newName
-        
-        # Check against Disk OR our reserved list
-        if ((Test-Path $destPath) -or ($OccupiedPaths -contains $destPath)) {
-            if ($conflict -eq "skip") {
-                Write-Warn "Target '$newName' exists. Skipping."
-                continue
-            } elseif ($conflict -eq "autonumber") {
-                $newName = Get-UniqueFilename -dir $dir -filename $newName -occupiedPaths $OccupiedPaths
-                $destPath = Join-Path $dir $newName
-                Write-Info "Conflict resolved: Renaming to '$newName'"
-            } elseif ($conflict -eq "overwrite") {
-                Write-Warn "Overwriting '$newName'"
-                # Remove dest so rename works
-                if (-not $dryrun) { Remove-Item $destPath -Force }
-            }
+    foreach ($grp in $Groups) {
+        $targetPath = $grp.Name
+        # Validate Folder Once
+        if (-not (Test-Path $targetPath)) {
+            Write-Warn "Folder not found: '$targetPath'. Skipping $($grp.Count) rules."
+            continue
         }
         
-        # Mark this path as occupied for subsequent checks in this batch
-        $OccupiedPaths += $destPath
-
-        if ($dryrun) {
-            Write-Host "[PREVIEW] '$($file.Name)' -> '$newName'" -ForegroundColor Cyan
-        } else {
-            try {
-                Rename-Item -LiteralPath $file.FullName -NewName $newName
-                Write-Success "'$($file.Name)' -> '$newName'"
-                $ops += @{ source = $file.FullName; dest = $destPath }
-            } catch {
-                Write-ErrorMsg "Failed to rename '$($file.Name)': $($_.Exception.Message)"
+        foreach ($rule in $grp.Group) {
+            $fullOldPath = Join-Path $targetPath $rule.OldName
+            if (-not (Test-Path $fullOldPath)) {
+                Write-Warn "File not found: '$($rule.OldName)' in '$targetPath'"
+                continue
             }
+            
+            # Use 'Get-Item' to get a file object similar to the scan mode
+            $file = Get-Item $fullOldPath
+            
+            Process-FileRename -file $file -newName $rule.NewName -conflict $conflict -OccupiedPaths ([ref]$OccupiedPaths) -dryrun $dryrun -ops ([ref]$ops)
+        }
+    }
+}
+
+# 2. Handle Scan Mode (Legacy 2-Column)
+$ScanRules = $Mapping | Where-Object { $_.Mode -eq "Scan" }
+if ($ScanRules) {
+    Write-Info "Processing legacy Scan Rules..."
+    foreach ($rule in $ScanRules) {
+        $matches = $files | Where-Object { $_.Name -eq $rule.OldName }
+        if (-not $matches) {
+            Write-Warn "File not found: '$($rule.OldName)'"
+            continue
+        }
+        
+        foreach ($file in $matches) {
+            Process-FileRename -file $file -newName $rule.NewName -conflict $conflict -OccupiedPaths ([ref]$OccupiedPaths) -dryrun $dryrun -ops ([ref]$ops)
         }
     }
 }
