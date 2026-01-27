@@ -67,6 +67,8 @@ function Get-UniqueFilename ($dir, $filename, $occupiedPaths) {
         $newVal = "${name}_${count}${ext}"
         $count++
     }
+    return $newVal
+}
 
 function Process-FileRename {
     param($file, $newName, $conflict, [ref]$OccupiedPaths, $dryrun, [ref]$ops)
@@ -102,8 +104,6 @@ function Process-FileRename {
             Write-ErrorMsg "Failed to rename '$($file.Name)': $($_.Exception.Message)"
         }
     }
-}
-    return $newVal
 }
 
 function Read-CsvData {
